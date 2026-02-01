@@ -11,8 +11,19 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/net/html"
 )
+
+type CrawlResult struct {
+	URL             string
+	Status          int
+	Title           string
+	MetaDescription string
+	Canonical       string
+}
 
 type urlSet struct {
 	URLs []struct {
@@ -41,32 +52,35 @@ func randomUserAgent() string {
 	return userAgents[rand.Intn(len(userAgents))]
 }
 
-func makeRequest(url string) ([]byte, string, error) {
+func makeRequest(url string) ([]byte, string, int, error) {
 	log.Println("REQUEST:", url)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, "", err
+		log.Println("REQUEST ERROR:", err)
+		return nil, "", 0, err
 	}
 
 	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Accept", "application/xml,text/xml,*/*")
+	req.Header.Set("Accept", "application/xml,text/xml,text/html,*/*")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, "", err
+		log.Println("HTTP ERROR:", url, err)
+		return nil, "", 0, err
 	}
 	defer resp.Body.Close()
 
 	ct := resp.Header.Get("Content-Type")
-	log.Println("RESPONSE:", resp.Status, "Content-Type:", ct)
+	log.Println("RESPONSE:", url, "STATUS:", resp.StatusCode, "CT:", ct)
 
 	var reader io.Reader = resp.Body
 	if strings.HasSuffix(url, ".gz") {
-		log.Println("GZIP detected:", url)
+		log.Println("GZIP DETECTED:", url)
 		gz, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return nil, ct, err
+			log.Println("GZIP ERROR:", err)
+			return nil, ct, resp.StatusCode, err
 		}
 		defer gz.Close()
 		reader = gz
@@ -74,10 +88,11 @@ func makeRequest(url string) ([]byte, string, error) {
 
 	body, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, ct, err
+		log.Println("READ ERROR:", err)
+		return nil, ct, resp.StatusCode, err
 	}
 
-	return body, ct, nil
+	return body, ct, resp.StatusCode, nil
 }
 
 func sanitizeXML(b []byte) []byte {
@@ -91,7 +106,7 @@ func extractURLsFromXML(data []byte) ([]string, error) {
 
 	var us urlSet
 	if xml.Unmarshal(data, &us) == nil && len(us.URLs) > 0 {
-		log.Println("Parsed urlset with", len(us.URLs), "URLs")
+		log.Println("SITEMAP TYPE: urlset | URLs:", len(us.URLs))
 		for _, u := range us.URLs {
 			urls = append(urls, u.Loc)
 		}
@@ -100,21 +115,21 @@ func extractURLsFromXML(data []byte) ([]string, error) {
 
 	var si siteMapIndex
 	if xml.Unmarshal(data, &si) == nil && len(si.Sitemaps) > 0 {
-		log.Println("Parsed sitemap index with", len(si.Sitemaps), "children")
+		log.Println("SITEMAP TYPE: index | CHILD SITEMAPS:", len(si.Sitemaps))
 		for _, sm := range si.Sitemaps {
-			log.Println("Following child sitemap:", sm.Loc)
-			time.Sleep(2 * time.Second)
+			log.Println("FOLLOW CHILD SITEMAP:", sm.Loc)
+			time.Sleep(1 * time.Second)
 
-			childData, _, err := makeRequest(sm.Loc)
+			childData, _, _, err := makeRequest(sm.Loc)
 			if err != nil {
-				log.Println("Child sitemap failed:", err)
+				log.Println("CHILD FETCH FAILED:", sm.Loc)
 				continue
 			}
 
 			childData = sanitizeXML(childData)
 			childURLs, err := extractURLsFromXML(childData)
 			if err != nil {
-				log.Println("Child parse failed:", err)
+				log.Println("CHILD PARSE FAILED:", sm.Loc)
 				continue
 			}
 
@@ -126,35 +141,98 @@ func extractURLsFromXML(data []byte) ([]string, error) {
 	return nil, fmt.Errorf("unsupported sitemap format")
 }
 
-func scrapePage(url string) {
-	log.Println("SCRAPE PAGE:", url)
-
-	req, err := http.NewRequest("GET", url, nil)
+func parseHTML(htmlBytes []byte) (string, string, string) {
+	doc, err := html.Parse(bytes.NewReader(htmlBytes))
 	if err != nil {
-		return
+		log.Println("HTML PARSE ERROR:", err)
+		return "", "", ""
 	}
 
-	req.Header.Set("User-Agent", randomUserAgent())
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Println("Fetch failed:", err)
-		return
-	}
-	defer resp.Body.Close()
+	var title, metaDesc, canonical string
 
-	log.Println("SCRAPED:", url, "Status:", resp.StatusCode)
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "title":
+				if n.FirstChild != nil {
+					title = strings.TrimSpace(n.FirstChild.Data)
+				}
+			case "meta":
+				var name, content string
+				for _, a := range n.Attr {
+					if a.Key == "name" && a.Val == "description" {
+						name = a.Val
+					}
+					if a.Key == "content" {
+						content = a.Val
+					}
+				}
+				if name == "description" {
+					metaDesc = content
+				}
+			case "link":
+				for _, a := range n.Attr {
+					if a.Key == "rel" && a.Val == "canonical" {
+						for _, b := range n.Attr {
+							if b.Key == "href" {
+								canonical = b.Val
+							}
+						}
+					}
+				}
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+
+	walk(doc)
+	return title, metaDesc, canonical
 }
 
-func scrapeSiteMap(sitemapURL string) error {
-	log.Println("START SITEMAP:", sitemapURL)
+func worker(id int, jobs <-chan string, results chan<- CrawlResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Println("WORKER STARTED:", id)
 
-	data, ct, err := makeRequest(sitemapURL)
-	if err != nil {
-		return err
+	for url := range jobs {
+		log.Println("WORKER", id, "FETCHING:", url)
+
+		body, ct, status, err := makeRequest(url)
+		if err != nil {
+			log.Println("WORKER", id, "FAILED:", url)
+			continue
+		}
+
+		if !strings.Contains(ct, "text/html") {
+			results <- CrawlResult{URL: url, Status: status}
+			continue
+		}
+
+		title, desc, canonical := parseHTML(body)
+
+		results <- CrawlResult{
+			URL:             url,
+			Status:          status,
+			Title:           title,
+			MetaDescription: desc,
+			Canonical:       canonical,
+		}
+
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	if strings.Contains(ct, "text/html") {
-		return fmt.Errorf("received HTML instead of XML")
+	log.Println("WORKER STOPPED:", id)
+}
+
+func crawlSiteMap(sitemapURL string) error {
+	log.Println("START CRAWL:", sitemapURL)
+
+	data, _, _, err := makeRequest(sitemapURL)
+	if err != nil {
+		return err
 	}
 
 	data = sanitizeXML(data)
@@ -163,13 +241,45 @@ func scrapeSiteMap(sitemapURL string) error {
 		return err
 	}
 
-	log.Println("TOTAL URLS FOUND:", len(urls))
+	log.Println("TOTAL URLS DISCOVERED:", len(urls))
 
-	for _, u := range urls {
-		scrapePage(u)
-		time.Sleep(300 * time.Millisecond)
+	jobs := make(chan string, 100)
+	results := make(chan CrawlResult, 100)
+
+	var wg sync.WaitGroup
+	workerCount := 5
+
+	log.Println("SPAWNING WORKERS:", workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker(i, jobs, results, &wg)
 	}
 
+	go func() {
+		for _, url := range urls {
+			jobs <- url
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for res := range results {
+		log.Printf(
+			"RESULT | URL=%s STATUS=%d TITLE=%q DESC=%q CANONICAL=%q",
+			res.URL,
+			res.Status,
+			res.Title,
+			res.MetaDescription,
+			res.Canonical,
+		)
+	}
+
+	log.Println("CRAWL COMPLETE")
 	return nil
 }
 
@@ -181,7 +291,7 @@ func main() {
 		return
 	}
 
-	if err := scrapeSiteMap(os.Args[1]); err != nil {
-		log.Println("ERROR:", err)
+	if err := crawlSiteMap(os.Args[1]); err != nil {
+		log.Println("FATAL ERROR:", err)
 	}
 }
